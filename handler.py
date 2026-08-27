@@ -95,19 +95,23 @@ def hyperspell_context(query: str, limit: int = 5) -> str:
     if not HYPERSPELL_KEY:
         return ""
     try:
-        url = f"{HYPERSPELL_URL}/v1/search?q={urllib.parse.quote(query)}&limit={limit}&user_id={urllib.parse.quote(HYPERSPELL_USER)}"
-        req = urllib.request.Request(url, headers={
-            "Authorization": f"Bearer {HYPERSPELL_KEY}",
-            "X-As-User": HYPERSPELL_USER,
-        })
+        body = json.dumps({"query": query, "max_results": limit}).encode()
+        req = urllib.request.Request(
+            f"{HYPERSPELL_URL}/memories/query",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {HYPERSPELL_KEY}",
+                "X-As-User": HYPERSPELL_USER,
+            },
+        )
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
-        # Normalize response shape: could be {"results":[...]} or {"memories":[...]}
-        results = data.get("results") or data.get("memories") or []
+        results = data.get("documents") or []
         if isinstance(results, list) and results:
             parts = []
             for r in results[:limit]:
-                text = r.get("text") or r.get("content") or r.get("summary") or ""
+                text = r.get("text") or r.get("content") or r.get("title") or ""
                 if text:
                     parts.append(text[:300])
             return "\n".join(parts)
@@ -119,31 +123,95 @@ def hyperspell_context(query: str, limit: int = 5) -> str:
 # ---------------------------------------------------------------------------
 # Vault MCP (local .md memory files)
 # ---------------------------------------------------------------------------
+class VaultMCPClient:
+    """Minimal MCP Streamable-HTTP client for the vault (session + SSE handling)."""
+
+    def __init__(self, url: str, token: str):
+        self.url = url
+        self.token = token
+        self.session_id = None
+
+    def _headers(self):
+        h = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self.token:
+            h["Authorization"] = f"Bearer {self.token}"
+        if self.session_id:
+            h["mcp-session-id"] = self.session_id
+        return h
+
+    def _post(self, payload: dict, timeout: int = 15):
+        req = urllib.request.Request(
+            self.url,
+            data=json.dumps(payload).encode(),
+            headers=self._headers(),
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            sid = resp.headers.get("mcp-session-id")
+            if sid:
+                self.session_id = sid
+            body = resp.read().decode()
+        # Parse SSE "event: message\ndata: {...}" or raw JSON
+        texts = []
+        for line in body.splitlines():
+            line = line.strip()
+            if line.startswith("data: "):
+                try:
+                    texts.append(json.loads(line[6:]))
+                except Exception:
+                    pass
+        if not texts:
+            try:
+                texts.append(json.loads(body))
+            except Exception:
+                pass
+        return texts[-1] if texts else {}
+
+    def ensure_session(self):
+        if self.session_id:
+            return
+        self._post({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "odin-voice", "version": "1.0"},
+            },
+        })
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def call_tool(self, name: str, args: dict, timeout: int = 15):
+        self.ensure_session()
+        resp = self._post({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": args},
+        }, timeout=timeout)
+        content = resp.get("result", {}).get("content", [])
+        return "\n".join(c.get("text", "") for c in content if isinstance(c, dict))
+
+
+_vault_client = None
+
+
+def get_vault_client():
+    global _vault_client
+    if _vault_client is None:
+        _vault_client = VaultMCPClient(VAULT_MCP_URL, VAULT_MCP_TOKEN)
+    return _vault_client
+
+
 def vault_search(query: str) -> str:
     """Search the local vault via MCP (through the Cloudflare tunnel)."""
     if not VAULT_MCP_TOKEN:
         return ""
     try:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": "vault_search", "arguments": {"query": query}},
-        }
-        req = urllib.request.Request(
-            VAULT_MCP_URL,
-            data=json.dumps(payload).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {VAULT_MCP_TOKEN}",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-        # MCP tool result shape: {result: {content: [{text: ...}]}}
-        content = data.get("result", {}).get("content", [])
-        texts = [c.get("text", "") for c in content if isinstance(c, dict)]
-        return "\n".join(texts)[:2000]
+        return get_vault_client().call_tool("vault_search", {"query": query})[:2000]
     except Exception as e:
         print(f"[odin-voice] vault err: {e}", flush=True)
     return ""
