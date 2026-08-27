@@ -1,26 +1,13 @@
 """
 ODIN VOICE — RunPod Serverless Worker
 =====================================
-GPU worker that handles Discord voice turns for Odin (Nick's AI chief of staff).
+GPU worker for Odin's Discord voice.
 
-Pipeline (per job):
-  1. Decode base64 audio from Discord voice capture
-  2. STT: Faster-Whisper (small.en, float16, CUDA)
-  3. Live context fetch:
-       - Hyperspell live autocontext (api.hyperspell.com, cloud)
-       - Vault MCP (.md memory files) via https://odin-mcp.douggie.au/vaultmcp/mcp
-  4. Brain: DeepSeek API (direct) — persona'd as Odin with SOUL.md + live context
-  5. TTS: Kokoro-82M bm_lewis (British male) → base64 wav
-  6. Return { text, audio_b64 }
+Two modes:
+  1. Full turn:  input {audio: b64, user_name} -> whisper STT -> DeepSeek (Odin) -> Kokoro TTS -> {text, audio}
+  2. TTS only:   input {text} -> DeepSeek (Odin) -> Kokoro TTS -> {text, audio}
 
-Env vars:
-  DEEPSEEK_API_KEY     — DeepSeek API key (required)
-  HYPERSPELL_API_KEY   — Hyperspell key for live autocontext (required)
-  HYPERSPELL_USER_ID   — Hyperspell userId (default nick.bartle94@gmail.com)
-  VAULT_MCP_URL        — default https://odin-mcp.douggie.au/vaultmcp/mcp
-  VAULT_MCP_TOKEN      — Bearer token for vault MCP (required)
-  KOKORO_VOICE         — default bm_lewis
-  WHISPER_MODEL        — default small.en
+Live context: Hyperspell (POST /memories/query) + vault MCP via Cloudflare tunnel.
 """
 
 import base64
@@ -33,9 +20,6 @@ import runpod
 import torch
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
@@ -50,22 +34,18 @@ VAULT_MCP_TOKEN = os.environ.get("VAULT_MCP_TOKEN", "")
 KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "bm_lewis")
 WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "small.en")
 
-# Odin persona — this is what makes the worker "another instance of me"
 ODIN_PERSONA = (
     "You are Odin, Nick Bartle's AI chief of staff and personal assistant. "
     "You are speaking to Nick by voice in a Discord voice channel. You are "
     "calm, competent, dry-witted, and warm when it counts. You call him 'bro' "
     "and 'man' occasionally. Reply in a concise, conversational way as if "
     "talking out loud. Do NOT use markdown, asterisks, bullet points, emojis, "
-    "or any formatting that would be read aloud awkwardly. Keep it short — a "
+    "or any formatting that would be read aloud awkwardly. Keep it short - a "
     "couple of sentences is ideal. Give a brief answer and stop; offer to "
     "expand only if genuinely useful. No newlines or special characters "
     "besides plain words and basic punctuation."
 )
 
-# ---------------------------------------------------------------------------
-# Models (loaded once at cold start)
-# ---------------------------------------------------------------------------
 print("[odin-voice] CUDA available:", torch.cuda.is_available(), flush=True)
 
 from faster_whisper import WhisperModel  # noqa: E402
@@ -83,15 +63,11 @@ def load_models():
     stt_model = WhisperModel(WHISPER_MODEL_NAME, device="cuda", compute_type="float16")
     print("[odin-voice] loading Kokoro (voice", KOKORO_VOICE + ")", flush=True)
     from kokoro import KPipeline  # noqa: E402
-    tts_pipeline = KPipeline(lang_code="b")  # b = British English
+    tts_pipeline = KPipeline(lang_code="b")
     print(f"[odin-voice] models loaded in {time.time()-t0:.1f}s", flush=True)
 
 
-# ---------------------------------------------------------------------------
-# Hyperspell live autocontext
-# ---------------------------------------------------------------------------
 def hyperspell_context(query: str, limit: int = 5) -> str:
-    """Pull relevant memories from Hyperspell (same API the OpenClaw plugin uses)."""
     if not HYPERSPELL_KEY:
         return ""
     try:
@@ -108,23 +84,19 @@ def hyperspell_context(query: str, limit: int = 5) -> str:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
         results = data.get("documents") or []
-        if isinstance(results, list) and results:
-            parts = []
-            for r in results[:limit]:
-                text = r.get("text") or r.get("content") or r.get("title") or ""
-                if text:
-                    parts.append(text[:300])
-            return "\n".join(parts)
+        parts = []
+        for r in results[:limit]:
+            text = r.get("text") or r.get("content") or r.get("title") or ""
+            if text:
+                parts.append(text[:300])
+        return "\n".join(parts)
     except Exception as e:
         print(f"[odin-voice] hyperspell err: {e}", flush=True)
     return ""
 
 
-# ---------------------------------------------------------------------------
-# Vault MCP (local .md memory files)
-# ---------------------------------------------------------------------------
 class VaultMCPClient:
-    """Minimal MCP Streamable-HTTP client for the vault (session + SSE handling)."""
+    """Minimal MCP Streamable-HTTP client for the vault."""
 
     def __init__(self, url: str, token: str):
         self.url = url
@@ -153,7 +125,6 @@ class VaultMCPClient:
             if sid:
                 self.session_id = sid
             body = resp.read().decode()
-        # Parse SSE "event: message\ndata: {...}" or raw JSON
         texts = []
         for line in body.splitlines():
             line = line.strip()
@@ -173,23 +144,16 @@ class VaultMCPClient:
         if self.session_id:
             return
         self._post({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "odin-voice", "version": "1.0"},
-            },
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "odin-voice", "version": "1.0"}},
         })
         self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
     def call_tool(self, name: str, args: dict, timeout: int = 15):
         self.ensure_session()
         resp = self._post({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": name, "arguments": args},
         }, timeout=timeout)
         content = resp.get("result", {}).get("content", [])
@@ -207,7 +171,6 @@ def get_vault_client():
 
 
 def vault_search(query: str) -> str:
-    """Search the local vault via MCP (through the Cloudflare tunnel)."""
     if not VAULT_MCP_TOKEN:
         return ""
     try:
@@ -217,36 +180,24 @@ def vault_search(query: str) -> str:
     return ""
 
 
-# ---------------------------------------------------------------------------
-# DeepSeek brain
-# ---------------------------------------------------------------------------
 def ask_deepseek(transcript: str, context: str) -> str:
-    messages = [
-        {"role": "system", "content": ODIN_PERSONA},
-    ]
+    messages = [{"role": "system", "content": ODIN_PERSONA}]
     if context.strip():
         messages.append({
             "role": "system",
             "content": (
                 "Relevant recalled context from Nick's memory (hyperspell + vault). "
-                "Use it only if relevant to what he says; don't force it:\n\n" + context[:4000]
+                "Use it only if relevant; don't force it:\n\n" + context[:4000]
             ),
         })
     messages.append({"role": "user", "content": transcript})
-
     body = json.dumps({
-        "model": DEEPSEEK_MODEL,
-        "messages": messages,
-        "max_tokens": 300,
-        "temperature": 0.7,
+        "model": DEEPSEEK_MODEL, "messages": messages,
+        "max_tokens": 300, "temperature": 0.7,
     }).encode()
     req = urllib.request.Request(
-        DEEPSEEK_URL,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {DEEPSEEK_KEY}",
-        },
+        DEEPSEEK_URL, data=body,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {DEEPSEEK_KEY}"},
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
@@ -266,9 +217,6 @@ def clean_for_voice(text: str) -> str:
     return t
 
 
-# ---------------------------------------------------------------------------
-# Audio
-# ---------------------------------------------------------------------------
 def decode_audio(audio_b64: str):
     raw = base64.b64decode(audio_b64)
     if raw[:4] == b"RIFF" or raw[:2] == b"\xff\xfb" or raw[:3] == b"ID3":
@@ -319,24 +267,27 @@ def synthesize(text: str) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-# ---------------------------------------------------------------------------
-# Handler
-# ---------------------------------------------------------------------------
 def handler(job):
     job_input = job.get("input", {})
-    audio_b64 = job_input.get("audio")
+    text_in = job_input.get("text", "")
+    audio_b64 = job_input.get("audio", "")
     user_name = job_input.get("user_name", "Nick")
-    if not audio_b64:
-        return {"error": "no audio provided"}
 
     load_models()
     t0 = time.time()
 
-    transcript = transcribe(audio_b64)
-    if not transcript.strip():
-        return {"text": "", "audio": None}
+    # Mode 1: full turn (audio in)
+    if audio_b64:
+        transcript = transcribe(audio_b64)
+        if not transcript.strip():
+            return {"text": "", "audio": None}
+    # Mode 2: text in (TTS only path for Discord native voice)
+    elif text_in.strip():
+        transcript = text_in.strip()
+    else:
+        return {"error": "no audio or text provided"}
 
-    # Live context: hyperspell + vault (this is what makes it "me")
+    # Live context
     context = hyperspell_context(transcript)
     if not context.strip():
         context = vault_search(transcript)
