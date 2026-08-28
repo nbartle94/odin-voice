@@ -133,6 +133,11 @@ function startListening(connection) {
     const audioStream = receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.AfterSilence, duration: 700 },
     });
+    // Swallow per-packet decrypt errors (non-fatal; some packets arrive out of order)
+    audioStream.on("error", (e) => {
+      if (e.message && e.message.includes("decrypt")) return; // benign
+      console.error(`[odin-voice-bot] audio stream error: ${e.message}`);
+    });
     // Convert Opus (48k) -> PCM s16le via prism
     const decoder = new prism.opus.Decoder({ rate: 48000, channels: 1, frameSize: 960 });
     const pcmStream = audioStream.pipe(decoder);
