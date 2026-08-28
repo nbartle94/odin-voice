@@ -121,6 +121,7 @@ function startListening(connection) {
 
   const receiver = connection.receiver;
   receiver.speaking.on("start", (userId) => {
+    console.log(`[odin-voice-bot] SPEAKING START user=${userId} owner=${OWNER_ID} isProcessing=${isProcessing}`);
     // Only listen to the owner (if set) or anyone (if not)
     if (OWNER_ID && userId !== OWNER_ID) return;
     if (isProcessing) return; // don't interrupt while replying
@@ -139,8 +140,10 @@ function startListening(connection) {
 
     pcmStream.on("data", (chunk) => {
       audioChunks.push(chunk);
+      console.log(`[odin-voice-bot] pcm chunk: ${chunk.length} bytes (total ${Buffer.concat(audioChunks).length})`);
     });
     pcmStream.on("end", () => {
+      console.log(`[odin-voice-bot] pcm stream END, chunks=${audioChunks.length} bytes=${Buffer.concat(audioChunks).length}`);
       if (audioChunks.length === 0) return;
       const pcm = Buffer.concat(audioChunks);
       // Convert PCM 48k s16le -> WAV (RunPod handler decodes raw PCM as 16k; send 48k wav and let whisper handle)
@@ -148,6 +151,10 @@ function startListening(connection) {
       console.log(`[odin-voice-bot] captured ${wav.length} bytes wav, sending to RunPod...`);
       handleTurn(wav);
     });
+    pcmStream.on("error", (e) => console.error("[odin-voice-bot] pcm error:", e.message));
+    audioStream.on("error", (e) => console.error("[odin-voice-bot] audiostream error:", e.message));
+    audioStream.on("end", () => console.log("[odin-voice-bot] audiostream END (before decode)"));
+    audioStream.on("close", () => console.log("[odin-voice-bot] audiostream CLOSE"));
   });
 
   // Fallback: if no speaking event within 10s, reset
