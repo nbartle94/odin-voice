@@ -11,7 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Torch pinned to cu128 wheels (matches base image CUDA 12.8)
-RUN pip install --no-cache-dir torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+# torchaudio required by coqui-tts (XTTS) — MUST match torch version + wheel index
+RUN pip install --no-cache-dir torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
 
 # Python deps (no torch in requirements — pinned above)
 COPY requirements.txt .

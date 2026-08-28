@@ -1,18 +1,39 @@
 """
 ODIN VOICE — RunPod Serverless Worker
 =====================================
-GPU worker for Odin's Discord voice.
+GPU worker for Odin's Discord voice. THE FAST BRAIN.
 
-Two modes:
-  1. Full turn:  input {audio: b64, user_name} -> whisper STT -> DeepSeek (Odin) -> Kokoro TTS -> {text, audio}
-  2. TTS only:   input {text} -> DeepSeek (Odin) -> Kokoro TTS -> {text, audio}
+Architecture (as requested by Nick 2026-08-28):
+  Discord voice -> audio -> THIS WORKER:
+    1. STT:  Faster-Whisper (small.en, float16, CUDA)
+    2. Brain: DeepSeek API DIRECT (api.deepseek.com) — instant, NO gateway in the loop
+    3. Context: Hyperspell (live memory) + Vault MCP (via odin-mcp.douggie.au tunnel)
+       + OPTIONAL gateway tool execution when Nick asks for tasks/info that need tools
+    4. TTS:  XTTS v2 (Jarvis voice clone) -> base64 wav
+    5. Return { text, audio }
 
-Live context: Hyperspell (POST /memories/query) + vault MCP via Cloudflare tunnel.
+The OpenClaw gateway is NOT in the chat path. It is only consulted when the
+worker's DeepSeek brain decides the request needs real tool access (calendar,
+email, files, etc.). That call goes through the vault MCP tunnel to the gateway,
+and the result is folded into the reply.
+
+Env vars:
+  DEEPSEEK_API_KEY      — DeepSeek API key (required)
+  HYPERSPELL_API_KEY    — Hyperspell key for live autocontext (required)
+  HYPERSPELL_USER_ID    — Hyperspell userId (default nick.bartle94@gmail.com)
+  VAULT_MCP_URL         — default https://odin-mcp.douggie.au/vaultmcp/mcp
+  VAULT_MCP_TOKEN       — Bearer token for vault MCP (required)
+  GATEWAY_CHAT_URL      — OpenClaw gateway chat completions (for tool turns), default https://odin-mcp.douggie.au/v1/chat/completions
+  GATEWAY_TOKEN         — OpenClaw gateway token (for tool turns)
+  XTTS_VOICE            — default "" (uses ref wav)
+  XTTS_REF_WAV          — default /odin-voice/refs/jarvis.wav
+  WHISPER_MODEL         — default small.en
 """
 
 import base64
 import json
 import os
+import re
 import time
 import urllib.request
 
@@ -20,6 +41,9 @@ import runpod
 import torch
 import numpy as np
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
@@ -30,6 +54,10 @@ HYPERSPELL_URL = "https://api.hyperspell.com"
 
 VAULT_MCP_URL = os.environ.get("VAULT_MCP_URL", "https://odin-mcp.douggie.au/vaultmcp/mcp")
 VAULT_MCP_TOKEN = os.environ.get("VAULT_MCP_TOKEN", "")
+
+# Gateway chat completions for TOOL turns only (not the chat path)
+GATEWAY_CHAT_URL = os.environ.get("GATEWAY_CHAT_URL", "https://odin-mcp.douggie.au/v1/chat/completions")
+GATEWAY_TOKEN = os.environ.get("GATEWAY_TOKEN", "")
 
 XTTS_VOICE = os.environ.get("XTTS_VOICE", "")
 XTTS_REF_WAV = os.environ.get("XTTS_REF_WAV", "/odin-voice/refs/jarvis.wav")
@@ -65,7 +93,6 @@ def load_models():
     print("[odin-voice] loading XTTS v2", flush=True)
     from TTS.tts.configs.xtts_config import XttsConfig  # noqa: E402
     from TTS.tts.models.xtts import Xtts  # noqa: E402
-    from TTS.utils.audio.numpy_transforms import fix_audio_length  # noqa: E402
     model_path = os.environ.get("XTTS_MODEL_PATH", "")
     if model_path:
         config = XttsConfig()
@@ -80,7 +107,11 @@ def load_models():
     print(f"[odin-voice] models loaded in {time.time()-t0:.1f}s", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Hyperspell live autocontext
+# ---------------------------------------------------------------------------
 def hyperspell_context(query: str, limit: int = 5) -> str:
+    """Pull relevant memories from Hyperspell (same API the OpenClaw plugin uses)."""
     if not HYPERSPELL_KEY:
         return ""
     try:
@@ -97,19 +128,23 @@ def hyperspell_context(query: str, limit: int = 5) -> str:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
         results = data.get("documents") or []
-        parts = []
-        for r in results[:limit]:
-            text = r.get("text") or r.get("content") or r.get("title") or ""
-            if text:
-                parts.append(text[:300])
-        return "\n".join(parts)
+        if isinstance(results, list) and results:
+            parts = []
+            for r in results[:limit]:
+                text = r.get("text") or r.get("content") or r.get("title") or ""
+                if text:
+                    parts.append(text[:300])
+            return "\n".join(parts)
     except Exception as e:
         print(f"[odin-voice] hyperspell err: {e}", flush=True)
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Vault MCP (local .md memory files)
+# ---------------------------------------------------------------------------
 class VaultMCPClient:
-    """Minimal MCP Streamable-HTTP client for the vault."""
+    """Minimal MCP Streamable-HTTP client for the vault (session + SSE handling)."""
 
     def __init__(self, url: str, token: str):
         self.url = url
@@ -159,7 +194,7 @@ class VaultMCPClient:
         self._post({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                       "clientInfo": {"name": "odin-voice", "version": "1.0"}},
+                       "clientInfo": {"name": "odin-voice", "version": "2.0"}},
         })
         self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
@@ -193,6 +228,57 @@ def vault_search(query: str) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Gateway tool execution (ONLY when the brain needs real tools)
+# ---------------------------------------------------------------------------
+def gateway_tool_turn(transcript: str, fast_reply: str) -> str:
+    """Send a task to the OpenClaw gateway (full agent with tools) and return its text.
+
+    Used when Nick asks for something that needs real tool access (calendar,
+    email, files, web, etc.). This is the SLOW path but it's only invoked when
+    the fast DeepSeek brain decides it's needed. Returns the agent's reply.
+    """
+    if not GATEWAY_TOKEN:
+        return ""
+    try:
+        body = json.dumps({
+            "model": "openclaw/default",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Odin, Nick's AI chief of staff. Nick just spoke via "
+                        "voice. The fast brain drafted a quick reply; if the task "
+                        "needs real tools (calendar, email, files, web, memory), "
+                        "perform it and give a concise spoken-style answer. "
+                        "No markdown, no emojis, couple of sentences.\n\n"
+                        f"Fast brain draft: {fast_reply}"
+                    ),
+                },
+                {"role": "user", "content": transcript},
+            ],
+            "user": "voice-runpod",
+        }).encode()
+        req = urllib.request.Request(
+            GATEWAY_CHAT_URL,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GATEWAY_TOKEN}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            data = json.loads(resp.read().decode())
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return clean_for_voice(content) if content else ""
+    except Exception as e:
+        print(f"[odin-voice] gateway tool turn err: {e}", flush=True)
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek brain (fast path)
+# ---------------------------------------------------------------------------
 def ask_deepseek(transcript: str, context: str) -> str:
     messages = [{"role": "system", "content": ODIN_PERSONA}]
     if context.strip():
@@ -200,17 +286,23 @@ def ask_deepseek(transcript: str, context: str) -> str:
             "role": "system",
             "content": (
                 "Relevant recalled context from Nick's memory (hyperspell + vault). "
-                "Use it only if relevant; don't force it:\n\n" + context[:4000]
+                "Use it only if relevant to what he says; don't force it:\n\n" + context[:4000]
             ),
         })
     messages.append({"role": "user", "content": transcript})
     body = json.dumps({
-        "model": DEEPSEEK_MODEL, "messages": messages,
-        "max_tokens": 300, "temperature": 0.7,
+        "model": DEEPSEEK_MODEL,
+        "messages": messages,
+        "max_tokens": 300,
+        "temperature": 0.7,
     }).encode()
     req = urllib.request.Request(
-        DEEPSEEK_URL, data=body,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {DEEPSEEK_KEY}"},
+        DEEPSEEK_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {DEEPSEEK_KEY}",
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
@@ -220,8 +312,21 @@ def ask_deepseek(transcript: str, context: str) -> str:
         return f"Brain error: {e}"
 
 
+def needs_tools(transcript: str) -> bool:
+    """Heuristic: does this request need live tool access (calendar, email, files, web)?"""
+    patterns = [
+        r"\b(calendar|schedule|appointment|meeting|remind|reminder)\b",
+        r"\b(email|mail|inbox|send)\b",
+        r"\b(file|document|drive|folder)\b",
+        r"\b(check|look up|lookup|search|find|pull up|fetch|get)\b",
+        r"\b(weather|news|price|stock|score|result)\b",
+        r"\b(who|what time|what day|when is|where is)\b",
+        r"\b(task|todo|to[- ]do)\b",
+    ]
+    return any(re.search(p, transcript, re.IGNORECASE) for p in patterns)
+
+
 def clean_for_voice(text: str) -> str:
-    import re
     t = re.sub(r"[*_#`~>|\\-]{1,}", " ", text)
     t = re.sub(r"\[([^]]*)\]\([^)]*\)", r"\1", t)
     t = re.sub(r"!\[([^]]*)\]\([^)]*\)", r"\1", t)
@@ -230,6 +335,9 @@ def clean_for_voice(text: str) -> str:
     return t
 
 
+# ---------------------------------------------------------------------------
+# Audio
+# ---------------------------------------------------------------------------
 def decode_audio(audio_b64: str):
     raw = base64.b64decode(audio_b64)
     if raw[:4] == b"RIFF" or raw[:2] == b"\xff\xfb" or raw[:3] == b"ID3":
@@ -271,7 +379,6 @@ def synthesize(text: str) -> str:
     if XTTS_REF_WAV and os.path.exists(XTTS_REF_WAV):
         kwargs = {"speaker_wav": XTTS_REF_WAV}
 
-    # TTS.api returns a 24k tensor; model path returns tuple (wav, sr)
     if hasattr(tts_pipeline, "tts"):
         wav = tts_pipeline.tts(text=text, speaker=speaker, language="en", **kwargs)
         import numpy as _np
@@ -285,7 +392,6 @@ def synthesize(text: str) -> str:
     wav = wav.squeeze()
     if wav.dtype != np.float32:
         wav = wav.astype(np.float32)
-    # normalize to [-1, 1]
     if wav.abs().max() > 1.0:
         wav = wav / 32768.0
 
@@ -298,6 +404,9 @@ def synthesize(text: str) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
+# ---------------------------------------------------------------------------
+# Handler
+# ---------------------------------------------------------------------------
 def handler(job):
     job_input = job.get("input", {})
     text_in = job_input.get("text", "")
@@ -318,12 +427,22 @@ def handler(job):
     else:
         return {"error": "no audio or text provided"}
 
-    # Live context
+    # Live context (fast, non-blocking-ish)
     context = hyperspell_context(transcript)
     if not context.strip():
         context = vault_search(transcript)
 
+    # Fast brain: DeepSeek direct
     reply = ask_deepseek(transcript, context)
+
+    # Tool path: if the request needs real tools, consult the gateway agent
+    if needs_tools(transcript):
+        t_tool = time.time()
+        tool_reply = gateway_tool_turn(transcript, reply)
+        if tool_reply.strip():
+            reply = tool_reply
+        print(f"[odin-voice] gateway tool turn took {time.time()-t_tool:.1f}s", flush=True)
+
     audio_b64_out = synthesize(reply) if reply.strip() else None
 
     print(f"[odin-voice] turn done in {time.time()-t0:.1f}s | reply: {reply[:80]!r}", flush=True)
