@@ -296,26 +296,6 @@ client.on(Events.ClientReady, async () => {
     console.error("[odin-voice-bot] command registration failed:", err.message);
   }
 
-  // Auto-join if configured
-  if (AUTO_JOIN_CHANNEL) {
-    const tryJoin = async (attempt) => {
-      try {
-        const ch = await client.channels.fetch(AUTO_JOIN_CHANNEL);
-        if (ch && ch.isVoiceBased()) {
-          await joinVoice(ch);
-          console.log(`[odin-voice-bot] auto-joined ${ch.name}`);
-        } else {
-          console.error(`[odin-voice-bot] auto-join channel ${AUTO_JOIN_CHANNEL} is not voice`);
-        }
-      } catch (err) {
-        console.error(`[odin-voice-bot] auto-join attempt ${attempt} failed: ${err.message}`);
-        console.log(`[odin-voice-bot] retrying auto-join in 20s (attempt ${attempt})...`);
-        setTimeout(() => tryJoin(attempt + 1), 20000);
-      }
-    };
-    // Give the client a moment to fully hydrate, then join
-    setTimeout(() => tryJoin(1), 5000);
-  }
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -375,7 +355,31 @@ client.on(Events.MessageCreate, async (message) => {
   }
 });
 
+
+// ---------- Auto-join when owner enters voice ----------
+client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+  if (newState.member?.id !== OWNER_ID) return;
+  if (newState.channelId && !currentConnection) {
+    console.log(`[odin-voice-bot] owner joined voice channel ${newState.channelId}, joining...`);
+    try {
+      const ch = await client.channels.fetch(newState.channelId);
+      if (ch?.isVoiceBased()) {
+        currentChannel = newState.guild?.systemChannel || null;
+        await joinVoice(ch);
+        console.log(`[odin-voice-bot] joined ${ch.name} (owner present)`);
+      }
+    } catch (err) {
+      console.error(`[odin-voice-bot] owner-join failed: ${err.message}`);
+    }
+  } else if (!newState.channelId && currentConnection) {
+    // Owner left voice; leave too
+    console.log("[odin-voice-bot] owner left voice, leaving");
+    await leaveVoice();
+  }
+});
+
 // ---------- Startup ----------
+
 client.on(Events.Error, (err) => console.error("[odin-voice-bot] client error:", err));
 client.login(DISCORD_TOKEN).catch((err) => {
   console.error("[odin-voice-bot] login failed:", err.message);
