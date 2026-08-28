@@ -1,5 +1,5 @@
 # ODIN VOICE — RunPod Serverless Worker
-# STT: Faster-Whisper | Brain: DeepSeek | TTS: Kokoro bm_lewis
+# STT: Faster-Whisper | Brain: DeepSeek | TTS: XTTS v2 (Jarvis clone)
 FROM runpod/base:1.1.0-cuda1281-ubuntu2204
 
 WORKDIR /odin-voice
@@ -17,8 +17,9 @@ RUN pip install --no-cache-dir torch==2.7.1 --index-url https://download.pytorch
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Worker code
+# Worker code + Jarvis voice reference
 COPY handler.py .
+COPY refs/jarvis.wav ./refs/jarvis.wav
 
 # RunPod serverless entrypoint
 CMD ["python", "-u", "handler.py"]

@@ -32,7 +32,7 @@ VAULT_MCP_URL = os.environ.get("VAULT_MCP_URL", "https://odin-mcp.douggie.au/vau
 VAULT_MCP_TOKEN = os.environ.get("VAULT_MCP_TOKEN", "")
 
 XTTS_VOICE = os.environ.get("XTTS_VOICE", "")
-XTTS_REF_WAV = os.environ.get("XTTS_REF_WAV", "")
+XTTS_REF_WAV = os.environ.get("XTTS_REF_WAV", "/odin-voice/refs/jarvis.wav")
 WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "small.en")
 
 ODIN_PERSONA = (
@@ -266,7 +266,7 @@ def synthesize(text: str) -> str:
     import io
     import wave
 
-    speaker = XTTS_VOICE or "Wulf"
+    speaker = XTTS_VOICE or "jarvis"
     kwargs = {}
     if XTTS_REF_WAV and os.path.exists(XTTS_REF_WAV):
         kwargs = {"speaker_wav": XTTS_REF_WAV}
