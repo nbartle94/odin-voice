@@ -9,13 +9,13 @@ Architecture (as requested by Nick 2026-08-28):
     2. Brain: DeepSeek API DIRECT (api.deepseek.com) — instant, NO gateway in the loop
     3. Context: Hyperspell (live memory) + Vault MCP (via odin-mcp.douggie.au tunnel)
        + OPTIONAL gateway tool execution when Nick asks for tasks/info that need tools
-    4. TTS:  XTTS v2 (Jarvis voice clone) -> base64 wav
+    4. TTS:  Kokoro bm_lewis (fast cold start, British male) -> base64 wav
     5. Return { text, audio }
 
 The OpenClaw gateway is NOT in the chat path. It is only consulted when the
 worker's DeepSeek brain decides the request needs real tool access (calendar,
-email, files, etc.). That call goes through the vault MCP tunnel to the gateway,
-and the result is folded into the reply.
+email, files, etc.). That call goes through the gateway chat completions, and
+the result is folded into the reply.
 
 Env vars:
   DEEPSEEK_API_KEY      — DeepSeek API key (required)
@@ -25,8 +25,7 @@ Env vars:
   VAULT_MCP_TOKEN       — Bearer token for vault MCP (required)
   GATEWAY_CHAT_URL      — OpenClaw gateway chat completions (for tool turns), default https://odin-mcp.douggie.au/v1/chat/completions
   GATEWAY_TOKEN         — OpenClaw gateway token (for tool turns)
-  XTTS_VOICE            — default "" (uses ref wav)
-  XTTS_REF_WAV          — default /odin-voice/refs/jarvis.wav
+  KOKORO_VOICE          — default bm_lewis
   WHISPER_MODEL         — default small.en
 """
 
@@ -59,8 +58,7 @@ VAULT_MCP_TOKEN = os.environ.get("VAULT_MCP_TOKEN", "")
 GATEWAY_CHAT_URL = os.environ.get("GATEWAY_CHAT_URL", "https://odin-mcp.douggie.au/v1/chat/completions")
 GATEWAY_TOKEN = os.environ.get("GATEWAY_TOKEN", "")
 
-XTTS_VOICE = os.environ.get("XTTS_VOICE", "")
-XTTS_REF_WAV = os.environ.get("XTTS_REF_WAV", "/odin-voice/refs/jarvis.wav")
+KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "bm_lewis")
 WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "small.en")
 
 ODIN_PERSONA = (
@@ -90,20 +88,9 @@ def load_models():
     t0 = time.time()
     print("[odin-voice] loading Whisper", WHISPER_MODEL_NAME, flush=True)
     stt_model = WhisperModel(WHISPER_MODEL_NAME, device="cuda", compute_type="float16")
-    print("[odin-voice] loading XTTS v2", flush=True)
-    from TTS.tts.configs.xtts_config import XttsConfig  # noqa: E402
-    from TTS.tts.models.xtts import Xtts  # noqa: E402
-    model_path = os.environ.get("XTTS_MODEL_PATH", "")
-    if model_path:
-        config = XttsConfig()
-        config.load_json(os.path.join(model_path, "config.json"))
-        tts_pipeline = Xtts.init_from_config(config)
-        tts_pipeline.load_checkpoint(config, checkpoint_dir=model_path, eval=True)
-        if torch.cuda.is_available():
-            tts_pipeline.cuda()
-    else:
-        from TTS.api import TTS  # noqa: E402
-        tts_pipeline = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cuda")
+    print("[odin-voice] loading Kokoro (voice", KOKORO_VOICE + ")", flush=True)
+    from kokoro import KPipeline  # noqa: E402
+    tts_pipeline = KPipeline(lang_code="b")  # b = British English
     print(f"[odin-voice] models loaded in {time.time()-t0:.1f}s", flush=True)
 
 
@@ -370,37 +357,22 @@ def transcribe(audio_b64: str) -> str:
 
 
 def synthesize(text: str) -> str:
-    """XTTS v2 TTS -> base64 wav (24k mono). Uses voice cloning if ref wav provided."""
+    """Kokoro TTS -> base64 wav (24k mono)."""
+    generator = tts_pipeline(text, voice=KOKORO_VOICE, speed=1.0)
+    chunks = []
+    for _, _, audio in generator:
+        chunks.append(audio)
+    if not chunks:
+        return ""
+    full = np.concatenate(chunks)
     import io
     import wave
-
-    speaker = XTTS_VOICE or "jarvis"
-    kwargs = {}
-    if XTTS_REF_WAV and os.path.exists(XTTS_REF_WAV):
-        kwargs = {"speaker_wav": XTTS_REF_WAV}
-
-    if hasattr(tts_pipeline, "tts"):
-        wav = tts_pipeline.tts(text=text, speaker=speaker, language="en", **kwargs)
-        import numpy as _np
-        if not isinstance(wav, _np.ndarray):
-            wav = _np.array(wav)
-    else:
-        out = tts_pipeline.synthesize(text, config=tts_pipeline.config, speaker_wav=XTTS_REF_WAV or speaker, language="en")
-        wav = out["wav"] if isinstance(out, dict) else out[0]
-        wav = torch.tensor(wav).cpu().numpy() if hasattr(wav, "cpu") else wav
-
-    wav = wav.squeeze()
-    if wav.dtype != np.float32:
-        wav = wav.astype(np.float32)
-    if wav.abs().max() > 1.0:
-        wav = wav / 32768.0
-
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(24000)
-        w.writeframes((wav * 32767).astype(np.int16).tobytes())
+        w.writeframes((full * 32767).astype(np.int16).tobytes())
     return base64.b64encode(buf.getvalue()).decode()
 
 
